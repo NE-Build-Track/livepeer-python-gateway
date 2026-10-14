@@ -360,3 +360,45 @@ class TestLivePaymentSession:
         assert first.address == "opaque-sender"
         assert first.sig == "opaque-signature"
         assert len(calls) == 1
+
+    async def test_manifest_id_comes_from_the_challenge_and_survives_refresh(
+        self,
+    ) -> None:
+        payment_requests = 0
+
+        async def _post_json(
+            url: str,
+            payload: dict[str, object],
+            *,
+            headers: dict[str, str] | None = None,
+            timeout: float = 5.0,
+        ) -> dict[str, object]:
+            nonlocal payment_requests
+            del payload, headers, timeout
+            if url == "https://signer.example.com/generate-live-payment":
+                payment_requests += 1
+                if payment_requests == 2:
+                    raise SignerRefreshRequired("refresh")
+                return {
+                    "payment": "payment",
+                    "segCreds": "segment",
+                    "state": {"state": "one"},
+                }
+            if url == "https://signer.example.com/sign-orchestrator-info":
+                return {"address": "opaque-sender", "signature": "opaque-signature"}
+            if url == "https://orch.example.com/refresh-payment":
+                return {"payment_params": "new-payment-params"}
+            raise AssertionError(f"unexpected POST {url}")
+
+        session = LivePaymentSession(
+            "https://signer.example.com",
+            type="fixed",
+            challenge=_challenge(),
+        )
+        assert session.manifest_id == "manifest-1"
+        with mock.patch("livepeer_gateway.http.post_json", side_effect=_post_json):
+            await session.get_payment()
+            await session.get_payment()
+
+        assert session.manifest_id == "manifest-1"
+        assert session._challenge.payment_params == "new-payment-params"

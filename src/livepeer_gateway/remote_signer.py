@@ -233,6 +233,11 @@ class LivePaymentSession:
         self._max_refresh_retries = max(0, int(max_refresh_retries))
         self._state: dict[str, Any] | None = None
 
+    @property
+    def manifest_id(self) -> str:
+        """The manifest ID from the 402 challenge this session pays for."""
+        return self._challenge.manifest_id
+
     async def get_payment(self) -> GetPaymentResponse:
         if not self._signer_url:
             return GetPaymentResponse(payment="", seg_creds=None)

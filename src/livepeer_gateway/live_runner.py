@@ -93,6 +93,7 @@ class LiveRunnerSessionEvent:
 
 
 LiveRunnerSessionCallback = Callable[[LiveRunnerSessionEvent], None | Awaitable[None]]
+LivePaymentSessionCallback = Callable[[LivePaymentSession], None | Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -768,6 +769,7 @@ async def call_runner(
     payment_unit: str | None = ...,
     timeout: float = ...,
     max_payment_challenge_retries: int = ...,
+    on_payment_session: LivePaymentSessionCallback | None = ...,
     stream: Literal[False] = False,
 ) -> LiveRunnerCallResult:
     pass
@@ -785,6 +787,7 @@ async def call_runner(
     payment_unit: str | None = ...,
     timeout: float = ...,
     max_payment_challenge_retries: int = ...,
+    on_payment_session: LivePaymentSessionCallback | None = ...,
     stream: Literal[True],
 ) -> LiveRunnerCallStream:
     pass
@@ -801,6 +804,7 @@ async def call_runner(
     payment_unit: str | None = None,
     timeout: float = 5.0,
     max_payment_challenge_retries: int = 3,
+    on_payment_session: LivePaymentSessionCallback | None = None,
     stream: bool = False,
 ) -> LiveRunnerCallResult | LiveRunnerCallStream:
     """Call a runner once and return its result (or a live stream if ``stream=True``).
@@ -808,6 +812,13 @@ async def call_runner(
     With ``signer_url`` set, payment is automatic and **per call**: a 402 challenge is
     paid via the signer and retried (up to ``max_payment_challenge_retries``), one job,
     one upfront payment. Raises ``LivepeerHTTPError`` on non-402 errors.
+
+    ``on_payment_session`` (sync or async) is called with each payment session the
+    signer signs, before the paid request goes out; if it raises, the request is not
+    sent. The signer charges when it signs, so a reported session can cost even if the
+    call then fails. A runner that answers 402 again after payment gets a new session;
+    metered calls keep paying on the one they have. ``session.manifest_id`` identifies
+    the orchestrator session each payment funds.
 
     ``application/json`` and ``+json`` types parse into ``result.data``; anything else
     (an image, ndjson) comes back unparsed in ``result.content`` + ``result.content_type``.
@@ -858,6 +869,8 @@ async def call_runner(
                 )
                 challenge = None
                 continue
+            # Callback failures, including SignerRefreshRequired, belong to the caller.
+            await _report_runner_payment(payment_session, payment, on_payment_session)
             request_headers["Livepeer-Payment"] = payment.payment
             request_headers["Livepeer-Segment"] = payment.seg_creds or ""
             session_id = challenge.manifest_id
@@ -1012,11 +1025,24 @@ async def _get_runner_payment(
         max_price=max_price.to_json() if max_price is not None else None,
     )
     payment = await session.get_payment()
+    return session, payment
+
+
+async def _report_runner_payment(
+    session: LivePaymentSession,
+    payment: GetPaymentResponse,
+    on_payment_session: LivePaymentSessionCallback | None,
+) -> None:
+    if on_payment_session is not None:
+        # The signer charged when it signed, so report the session even if the
+        # payment proves unusable below.
+        result = on_payment_session(session)
+        if inspect.isawaitable(result):
+            await result
     if not payment.payment:
         raise LivepeerGatewayError("Live runner payment response missing payment")
     if not payment.seg_creds:
         raise LivepeerGatewayError("Live runner payment response missing segCreds")
-    return session, payment
 
 
 def _runner_payment_type(
