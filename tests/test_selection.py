@@ -51,7 +51,7 @@ class TestRunnerSelection:
         assert candidate.runner_id == "runner-c"
         assert candidate.mode == "persistent"
         assert candidate.orchestrator_url == "https://orch-b"
-        assert candidate.raw["label"] == "runner-c-label"
+        assert candidate.raw["metadata"] == "runner-c-metadata"
         assert candidate.price_info is not None
         assert candidate.price_info.price == 25
         assert candidate.price_info.currency == "wei"
@@ -499,7 +499,7 @@ def _discovery_entries() -> list[dict[str, object]]:
                     "app": "app-c",
                     "runner_id": "runner-c",
                     "mode": "persistent",
-                    "label": "runner-c-label",
+                    "metadata": "runner-c-metadata",
                     "price_info": {
                         "price": 25,
                         "currency": "wei",
