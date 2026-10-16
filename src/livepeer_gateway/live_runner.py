@@ -1003,6 +1003,28 @@ async def _stop_funding(task: asyncio.Task[None] | None) -> None:
         await task
 
 
+def _clear_cancellation(task: asyncio.Task[object] | None) -> None:
+    if task is None:
+        return
+    while task.cancelling():
+        task.uncancel()
+
+
+async def _await_shielded(pending: Awaitable[object]) -> None:
+    """Wait for a shielded payment after this task was cancelled.
+
+    A cancelled task raises ``CancelledError`` at every await until the
+    cancellation count is cleared. Clearing it lets the signer finish. A
+    later cancellation is cleared the same way, then re-raised.
+    """
+    _clear_cancellation(asyncio.current_task())
+    try:
+        await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        await _await_shielded(pending)
+        raise
+
+
 async def _get_runner_payment(
     challenge: LivePaymentChallenge,
     *,
@@ -1039,19 +1061,14 @@ async def _get_runner_payment(
     )
     payment_request = session.get_payment()
     if on_payment_session is None:
-        payment = await payment_request
-    else:
-        payment_task = asyncio.create_task(payment_request)
-        try:
-            payment = await asyncio.shield(payment_task)
-        except asyncio.CancelledError:
-            drain = asyncio.gather(payment_task, return_exceptions=True)
-            while not drain.done():
-                try:
-                    await asyncio.shield(drain)
-                except asyncio.CancelledError:
-                    continue
-            raise
+        return session, await payment_request
+
+    payment_task = asyncio.create_task(payment_request)
+    try:
+        payment = await asyncio.shield(payment_task)
+    except asyncio.CancelledError:
+        await _await_shielded(asyncio.gather(payment_task, return_exceptions=True))
+        raise
     return session, payment
 
 

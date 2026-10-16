@@ -926,8 +926,9 @@ class TestCallRunnerPaymentSessions:
     async def test_reported_sessions_outlive_a_cancelled_call(self) -> None:
         reported: list[object] = []
         with _paid_runner([402, "hang"]) as (requests, sessions):
+            paid_call = _paid_call(reported.append)
             with pytest.raises(TimeoutError):
-                await asyncio.wait_for(_paid_call(reported.append), 0.1)
+                await asyncio.wait_for(paid_call, 0.1)
 
         assert len(requests) == 2
         assert reported == sessions
@@ -982,6 +983,9 @@ class TestCallRunnerPaymentSessions:
         ):
             call = asyncio.create_task(_paid_call(reported.append))
             await asyncio.wait_for(signer_charged.wait(), 1.0)
+            call.cancel()
+            await asyncio.sleep(0)
+            assert not call.done()
             call.cancel()
             await asyncio.sleep(0)
             assert not call.done()
