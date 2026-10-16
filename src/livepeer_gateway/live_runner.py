@@ -1045,7 +1045,12 @@ async def _get_runner_payment(
         try:
             payment = await asyncio.shield(payment_task)
         except asyncio.CancelledError:
-            await asyncio.gather(payment_task, return_exceptions=True)
+            drain = asyncio.gather(payment_task, return_exceptions=True)
+            while not drain.done():
+                try:
+                    await asyncio.shield(drain)
+                except asyncio.CancelledError:
+                    continue
             raise
     return session, payment
 
