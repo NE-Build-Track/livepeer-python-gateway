@@ -852,7 +852,10 @@ async def call_runner(
                     signer_url=signer_url or "",
                     signer_headers=signer_headers,
                     max_price=max_price,
+                    on_payment_session=on_payment_session,
                 )
+            except _RunnerPaymentCallbackError as e:
+                raise e.error
             except SignerRefreshRequired as e:
                 if attempt + 1 >= attempts:
                     raise
@@ -863,8 +866,7 @@ async def call_runner(
                 )
                 challenge = None
                 continue
-            # Callback failures, including SignerRefreshRequired, belong to the caller.
-            await _report_runner_payment(payment_session, payment, on_payment_session)
+            _validate_runner_payment(payment)
             request_headers["Livepeer-Payment"] = payment.payment
             request_headers["Livepeer-Segment"] = payment.seg_creds or ""
             session_id = challenge.manifest_id
@@ -1008,8 +1010,24 @@ async def _get_runner_payment(
     signer_url: str,
     signer_headers: dict[str, str] | None,
     max_price: LiveRunnerPriceInfo | None,
+    on_payment_session: LivePaymentSessionCallback | None,
     app: str | None = None,
 ) -> tuple[LivePaymentSession, GetPaymentResponse]:
+    session: LivePaymentSession
+
+    async def _report_payment() -> None:
+        if on_payment_session is None:
+            return
+        try:
+            result = on_payment_session(session)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:
+            raise _RunnerPaymentCallbackError(e) from e
+
+    callback_args: dict[str, Any] = {}
+    if on_payment_session is not None:
+        callback_args["_on_payment"] = _report_payment
     session = LivePaymentSession(
         signer_url=signer_url,
         signer_headers=signer_headers,
@@ -1017,22 +1035,28 @@ async def _get_runner_payment(
         challenge=challenge,
         app=app,
         max_price=max_price.to_json() if max_price is not None else None,
+        **callback_args,
     )
-    payment = await session.get_payment()
+    payment_request = session.get_payment()
+    if on_payment_session is None:
+        payment = await payment_request
+    else:
+        payment_task = asyncio.create_task(payment_request)
+        try:
+            payment = await asyncio.shield(payment_task)
+        except asyncio.CancelledError:
+            await asyncio.gather(payment_task, return_exceptions=True)
+            raise
     return session, payment
 
 
-async def _report_runner_payment(
-    session: LivePaymentSession,
-    payment: GetPaymentResponse,
-    on_payment_session: LivePaymentSessionCallback | None,
-) -> None:
-    if on_payment_session is not None:
-        # The signer charged when it signed, so report the session even if the
-        # payment proves unusable below.
-        result = on_payment_session(session)
-        if inspect.isawaitable(result):
-            await result
+class _RunnerPaymentCallbackError(Exception):
+    def __init__(self, error: Exception) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _validate_runner_payment(payment: GetPaymentResponse) -> None:
     if not payment.payment:
         raise LivepeerGatewayError("Live runner payment response missing payment")
     if not payment.seg_creds:
