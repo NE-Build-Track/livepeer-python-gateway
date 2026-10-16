@@ -11,6 +11,7 @@ from unittest import mock
 
 import pytest
 
+from livepeer_gateway import http as gateway_http
 from livepeer_gateway import live_runner
 from livepeer_gateway.errors import (
     LivepeerGatewayError,
@@ -692,6 +693,7 @@ def _paid_runner(
             challenge = kwargs["challenge"]
             assert isinstance(challenge, LivePaymentChallenge)
             self._challenge = challenge
+            self._on_payment = kwargs.get("_on_payment")
             sessions.append(self)
 
         @property
@@ -702,7 +704,13 @@ def _paid_runner(
             sign = pending_signs.pop(0) if pending_signs else None
             if isinstance(sign, Exception):
                 raise sign
-            return sign or SimpleNamespace(payment="payment-b64", seg_creds="seg-b64")
+            payment = sign or SimpleNamespace(
+                payment="payment-b64",
+                seg_creds="seg-b64",
+            )
+            if self._on_payment is not None:
+                await self._on_payment()
+            return payment
 
         async def run_payments(self) -> bool:
             await asyncio.Event().wait()
@@ -831,6 +839,67 @@ class TestCallRunnerPaymentSessions:
         assert reported == sessions
         assert len(requests) == 1
 
+    @pytest.mark.parametrize(
+        ("signer_response", "error"),
+        [
+            (
+                {"payment": "payment-b64", "segCreds": 123, "state": {}},
+                "invalid 'segCreds'",
+            ),
+            (
+                {"payment": "payment-b64", "segCreds": "seg-b64"},
+                "missing 'state' object",
+            ),
+        ],
+    )
+    async def test_real_session_reports_before_signer_response_validation(
+        self,
+        signer_response: dict[str, object],
+        error: str,
+    ) -> None:
+        requests: list[dict[str, str]] = []
+        reported: list[object] = []
+
+        async def _request_body(
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            **kwargs: object,
+        ) -> tuple[bytes, str]:
+            del kwargs
+            requests.append(dict(headers or {}))
+            raise LivepeerHTTPError(
+                402,
+                url,
+                _payment_challenge_body("manifest-1"),
+                "payment required",
+            )
+
+        with (
+            mock.patch.object(live_runner, "_request_body", _request_body),
+            mock.patch.object(
+                live_runner,
+                "get_signer_info",
+                new_callable=mock.AsyncMock,
+                return_value=SimpleNamespace(
+                    address="opaque-payer",
+                    sig="opaque-signature",
+                ),
+            ),
+            mock.patch.object(
+                gateway_http,
+                "post_json",
+                new_callable=mock.AsyncMock,
+                return_value=signer_response,
+            ),
+        ):
+            with pytest.raises(PaymentError, match=error):
+                await _paid_call(reported.append)
+
+        assert len(requests) == 1
+        assert len(reported) == 1
+        assert reported[0].manifest_id == "manifest-1"
+
     async def test_failing_callback_stops_the_paid_request(self) -> None:
         def _report(session: object) -> None:
             del session
@@ -862,6 +931,68 @@ class TestCallRunnerPaymentSessions:
 
         assert len(requests) == 2
         assert reported == sessions
+
+    async def test_cancellation_drains_a_signed_payment_response_before_returning(
+        self,
+    ) -> None:
+        requests: list[dict[str, str]] = []
+        reported: list[object] = []
+        signer_charged = asyncio.Event()
+        release_response = asyncio.Event()
+
+        async def _request_body(
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            **kwargs: object,
+        ) -> tuple[bytes, str]:
+            del kwargs
+            requests.append(dict(headers or {}))
+            if len(requests) == 1:
+                raise LivepeerHTTPError(
+                    402,
+                    url,
+                    _payment_challenge_body("manifest-1"),
+                    "payment required",
+                )
+            pytest.fail("cancelled call sent a paid runner request")
+
+        async def _sign_payment(*args: object, **kwargs: object) -> dict[str, object]:
+            del args, kwargs
+            signer_charged.set()
+            await release_response.wait()
+            return {
+                "payment": "payment-b64",
+                "segCreds": "seg-b64",
+                "state": {},
+            }
+
+        with (
+            mock.patch.object(live_runner, "_request_body", _request_body),
+            mock.patch.object(
+                live_runner,
+                "get_signer_info",
+                new_callable=mock.AsyncMock,
+                return_value=SimpleNamespace(
+                    address="opaque-payer",
+                    sig="opaque-signature",
+                ),
+            ),
+            mock.patch.object(gateway_http, "post_json", _sign_payment),
+        ):
+            call = asyncio.create_task(_paid_call(reported.append))
+            await asyncio.wait_for(signer_charged.wait(), 1.0)
+            call.cancel()
+            await asyncio.sleep(0)
+            assert not call.done()
+
+            release_response.set()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+
+        assert len(requests) == 1
+        assert len(reported) == 1
+        assert reported[0].manifest_id == "manifest-1"
 
 
 class _FakeO2RReader:

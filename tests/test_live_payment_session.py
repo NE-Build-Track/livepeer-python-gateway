@@ -105,6 +105,7 @@ class TestLivePaymentSession:
 
     async def test_get_payment_sends_opaque_payment_params_and_state(self) -> None:
         calls: list[tuple[str, dict[str, object], dict[str, str] | None]] = []
+        reported: list[str] = []
 
         async def _post_json(
             url: str,
@@ -133,12 +134,14 @@ class TestLivePaymentSession:
                     "currency": "wei",
                     "unit": "seconds",
                 },
+                _on_payment=lambda: reported.append("signed"),
             )
             first = await session.get_payment()
             second = await session.get_payment()
 
         assert first.payment == "payment"
         assert second.seg_creds == "segment"
+        assert reported == ["signed"]
         assert calls[0][0] == "https://signer.example.com/generate-live-payment"
         assert calls[0][1] == {
             "orchestrator": "opaque-payment-params",
