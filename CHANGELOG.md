@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Flexible request body types on call_runner and selectors.
+
 ### Changed
 
 - `discover_orchestrators` is now asynchronous and must be awaited, including
