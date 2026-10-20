@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Flexible request body types on call_runner and selectors.
+- `call_runner(on_payment_session=...)` callback for each new payment session
+- `LivePaymentSession.manifest_id` for payment attribution
 
 ### Changed
 

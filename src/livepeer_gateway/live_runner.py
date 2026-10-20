@@ -34,6 +34,7 @@ from .remote_signer import (
     GetPaymentResponse,
     LivePaymentChallenge,
     LivePaymentSession,
+    _SignedPaymentError,
     _freeze_headers,
     get_signer_info,
 )
@@ -89,6 +90,12 @@ class LiveRunnerSessionEvent:
 
 
 LiveRunnerSessionCallback = Callable[[LiveRunnerSessionEvent], None | Awaitable[None]]
+LivePaymentSessionCallback = Callable[[LivePaymentSession], None | Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class _PaymentSessionCallbackFailure:
+    error: BaseException
 
 
 @dataclass(frozen=True)
@@ -768,6 +775,7 @@ async def call_runner(
     payment_unit: str | None = ...,
     timeout: float = ...,
     max_payment_challenge_retries: int = ...,
+    on_payment_session: LivePaymentSessionCallback | None = ...,
     stream: Literal[False] = False,
 ) -> LiveRunnerCallResult:
     pass
@@ -786,6 +794,7 @@ async def call_runner(
     payment_unit: str | None = ...,
     timeout: float = ...,
     max_payment_challenge_retries: int = ...,
+    on_payment_session: LivePaymentSessionCallback | None = ...,
     stream: Literal[True],
 ) -> LiveRunnerCallStream:
     pass
@@ -803,6 +812,7 @@ async def call_runner(
     payment_unit: str | None = None,
     timeout: float = 5.0,
     max_payment_challenge_retries: int = 3,
+    on_payment_session: LivePaymentSessionCallback | None = None,
     stream: bool = False,
 ) -> LiveRunnerCallResult | LiveRunnerCallStream:
     """Call a runner once and return its result (or a live stream if ``stream=True``).
@@ -810,6 +820,11 @@ async def call_runner(
     With ``signer_url`` set, payment is automatic and **per call**: a 402 challenge is
     paid via the signer and retried (up to ``max_payment_challenge_retries``), one job,
     one upfront payment. Raises ``LivepeerHTTPError`` on non-402 errors.
+
+    After a payment string is obtained, `on_payment_session` is called.
+    Metered renewals do not invoke it. The callback may be sync or
+    async. Its exceptions propagate and abort the call. Cancellation waits for
+    an in-progress signer request and callback; callback errors still propagate.
 
     ``application/json`` and ``+json`` types parse into ``result.data``; anything else
     (an image, ndjson) comes back unparsed in ``result.content`` + ``result.content_type``.
@@ -852,14 +867,18 @@ async def call_runner(
                 request_headers[_LIVE_RUNNER_PAYER_ADDRESS_HEADER] = payer_address
             # Pending challenge means payment is needed.
             if challenge is not None:
+                payment_session = LivePaymentSession(
+                    signer_url=signer_url or "",
+                    signer_headers=signer_headers,
+                    type=payment_type,
+                    challenge=challenge,
+                    app=runner.app if runner is not None else None,
+                    max_price=max_price.to_json() if max_price is not None else None,
+                )
                 try:
-                    payment_session, payment = await _get_runner_payment(
-                        challenge,
-                        payment_type=payment_type,
-                        app=runner.app if runner is not None else None,
-                        signer_url=signer_url or "",
-                        signer_headers=signer_headers,
-                        max_price=max_price,
+                    payment_outcome = await _await_runner_payment(
+                        payment_session,
+                        on_payment_session=on_payment_session,
                     )
                 except SignerRefreshRequired as e:
                     if attempt + 1 >= attempts:
@@ -871,8 +890,15 @@ async def call_runner(
                     )
                     challenge = None
                     continue
+                if isinstance(payment_outcome, _PaymentSessionCallbackFailure):
+                    raise payment_outcome.error
+                payment = payment_outcome
+                if not payment.seg_creds:
+                    raise LivepeerGatewayError(
+                        "Live runner payment response missing segCreds"
+                    )
                 request_headers["Livepeer-Payment"] = payment.payment
-                request_headers["Livepeer-Segment"] = payment.seg_creds or ""
+                request_headers["Livepeer-Segment"] = cast(str, payment.seg_creds)
                 session_id = challenge.manifest_id
 
                 # Metered pricing bills for as long as the work runs.
@@ -964,6 +990,77 @@ async def call_runner(
             await state.aclose()
 
 
+async def _await_runner_payment(
+    payment_session: LivePaymentSession,
+    *,
+    on_payment_session: LivePaymentSessionCallback | None,
+) -> GetPaymentResponse | _PaymentSessionCallbackFailure:
+    if on_payment_session is None:
+        return await payment_session.get_payment()
+
+    async def _pay_and_report() -> GetPaymentResponse | _PaymentSessionCallbackFailure:
+        try:
+            payment_outcome = await payment_session.get_payment()
+        except _SignedPaymentError as error:
+            payment_outcome = error
+        callback_error = await _notify_payment_session(
+            on_payment_session,
+            payment_session,
+        )
+        if callback_error is not None:
+            return _PaymentSessionCallbackFailure(callback_error)
+        if isinstance(payment_outcome, _SignedPaymentError):
+            raise payment_outcome
+        return payment_outcome
+
+    payment_task = asyncio.create_task(_pay_and_report())
+    waiter = asyncio.gather(payment_task, return_exceptions=True)
+    cancelled = False
+    while not waiter.done():
+        try:
+            await asyncio.shield(waiter)
+        # Reporting must finish even if the caller cancels more than once.
+        except asyncio.CancelledError:  # NOSONAR
+            cancelled = True
+
+    return _runner_payment_result(payment_task, cancelled=cancelled)
+
+
+def _runner_payment_result(
+    payment_task: asyncio.Task[
+        GetPaymentResponse | _PaymentSessionCallbackFailure
+    ],
+    *,
+    cancelled: bool,
+) -> GetPaymentResponse | _PaymentSessionCallbackFailure:
+    if payment_task.cancelled():
+        raise asyncio.CancelledError
+    error = payment_task.exception()
+    if error is not None:
+        if cancelled:
+            raise asyncio.CancelledError
+        raise error
+    result = payment_task.result()
+    if isinstance(result, _PaymentSessionCallbackFailure):
+        return result
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+async def _notify_payment_session(
+    callback: LivePaymentSessionCallback,
+    payment_session: LivePaymentSession,
+) -> BaseException | None:
+    try:
+        result = callback(payment_session)
+        if inspect.isawaitable(result):
+            await result
+    except (Exception, asyncio.CancelledError) as error:
+        return error
+    return None
+
+
 def _parse_runner_payment_challenge(error: LivepeerHTTPError) -> LivePaymentChallenge:
     try:
         data = json.loads(error.body)
@@ -1010,31 +1107,6 @@ async def _stop_funding(task: asyncio.Task[None] | None) -> None:
         task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
-
-
-async def _get_runner_payment(
-    challenge: LivePaymentChallenge,
-    *,
-    payment_type: str,
-    signer_url: str,
-    signer_headers: dict[str, str] | None,
-    max_price: LiveRunnerPriceInfo | None,
-    app: str | None = None,
-) -> tuple[LivePaymentSession, GetPaymentResponse]:
-    session = LivePaymentSession(
-        signer_url=signer_url,
-        signer_headers=signer_headers,
-        type=payment_type,
-        challenge=challenge,
-        app=app,
-        max_price=max_price.to_json() if max_price is not None else None,
-    )
-    payment = await session.get_payment()
-    if not payment.payment:
-        raise LivepeerGatewayError("Live runner payment response missing payment")
-    if not payment.seg_creds:
-        raise LivepeerGatewayError("Live runner payment response missing segCreds")
-    return session, payment
 
 
 def _runner_payment_type(

@@ -33,8 +33,8 @@ CHALLENGE = {
 @pytest.fixture
 def signer(monkeypatch):
     monkeypatch.setattr(live_runner, "get_signer_info", mock.AsyncMock(return_value=SimpleNamespace(address="payer")))
-    payment = mock.AsyncMock(return_value=(None, SimpleNamespace(payment="paid", seg_creds="segment")))
-    monkeypatch.setattr(live_runner, "_get_runner_payment", payment)
+    payment = mock.AsyncMock(return_value=SimpleNamespace(payment="paid", seg_creds="segment"))
+    monkeypatch.setattr(live_runner, "_await_runner_payment", payment)
     return payment
 
 
@@ -244,10 +244,10 @@ async def test_early_payment_challenge_does_not_touch_source(
     assert source.reads == 3
     assert not source.closed
     signer.assert_awaited_once()
-    challenge = signer.call_args.args[0]
-    assert challenge.payment_params == CHALLENGE["payment_params"]
-    assert challenge.manifest_id == CHALLENGE["manifest_id"]
-    assert challenge.payment_url == CHALLENGE["payment_url"]
+    session = signer.call_args.args[0]
+    assert session.manifest_id == CHALLENGE["manifest_id"]
+    assert session._challenge.payment_params == CHALLENGE["payment_params"]
+    assert session._challenge.payment_url == CHALLENGE["payment_url"]
 
 
 @pytest.mark.parametrize("status,kind", [(402, "nonseekable"), (503, "iterator"), (307, "file")])

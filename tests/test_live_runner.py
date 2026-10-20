@@ -13,6 +13,7 @@ from livepeer_gateway import live_runner
 from livepeer_gateway.errors import (
     LivepeerGatewayError,
     LivepeerHTTPError,
+    PaymentError,
     SignerRefreshRequired,
 )
 from livepeer_gateway.live_runner import (
@@ -26,7 +27,7 @@ from livepeer_gateway.live_runner import (
     stop_runner_session,
     create_proxy,
 )
-from livepeer_gateway.remote_signer import LivePaymentChallenge
+from livepeer_gateway.remote_signer import LivePaymentChallenge, LivePaymentSession
 
 
 class TestLiveRunnerHelpers:
@@ -629,6 +630,324 @@ class TestLiveRunnerSession:
         ]
         assert unpaid_count == 2
         assert payment_attempts == 2
+
+
+class TestPaymentSessionCallback:
+    @pytest.fixture
+    def payment_call(self, request):
+        url = "https://runner.example.com/call"
+        stream = getattr(request, "param", False)
+        reply = (
+            (
+                SimpleNamespace(close=mock.AsyncMock()),
+                SimpleNamespace(
+                    status=200, headers={}, _writer=None, close=mock.Mock()
+                ),
+            )
+            if stream
+            else _json_data({"ok": True})
+        )
+
+        def challenge(manifest):
+            return LivepeerHTTPError(402, url, _payment_challenge_body(manifest))
+
+        transport = mock.AsyncMock(side_effect=[challenge("manifest-1"), reply])
+        signer = mock.AsyncMock(
+            return_value={"payment": "payment", "segCreds": "segment", "state": {}}
+        )
+        with (
+            mock.patch.object(
+                live_runner, "open_stream" if stream else "_request_body", transport
+            ),
+            mock.patch.object(
+                live_runner,
+                "get_signer_info",
+                mock.AsyncMock(return_value=SimpleNamespace(address="payer")),
+            ),
+            mock.patch("livepeer_gateway.http.post_json", signer),
+        ):
+            yield SimpleNamespace(
+                kwargs=dict(
+                    runner_url=url,
+                    signer_url="https://signer.example.com",
+                    payment_unit="fixed",
+                    stream=stream,
+                ),
+                transport=transport,
+                signer=signer,
+                reply=reply,
+                challenge=challenge,
+            )
+
+    @pytest.mark.parametrize(
+        "payment_call,async_callback,payment_unit",
+        [(False, False, "fixed"), (True, True, "seconds")],
+        indirect=["payment_call"],
+    )
+    async def test_reports_each_successful_session_before_dispatch(
+        self, payment_call, async_callback, payment_unit
+    ) -> None:
+        call = payment_call
+        call.kwargs["payment_unit"] = payment_unit
+        call.signer.side_effect = [SignerRefreshRequired("refresh")] + [
+            call.signer.return_value
+        ] * 2
+        call.transport.side_effect = [
+            call.challenge("refused"),
+            call.challenge("manifest-1"),
+            call.challenge("manifest-2"),
+            call.reply,
+        ]
+        sessions: list[LivePaymentSession] = []
+
+        def collect(session):
+            assert (
+                call.signer.await_count
+                == call.transport.await_count
+                == len(sessions) + 2
+            )
+            sessions.append(session)
+
+        callback = mock.AsyncMock(side_effect=collect) if async_callback else collect
+        result = await call_runner(**call.kwargs, on_payment_session=callback)
+        if call.kwargs["stream"]:
+            await result.aclose()
+        assert [s.manifest_id for s in sessions] == ["manifest-1", "manifest-2"]
+        assert result.payment_session is (
+            sessions[-1] if payment_unit == "seconds" else None
+        )
+        assert call.transport.await_count == 4
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RuntimeError("failed"),
+            SignerRefreshRequired("failed"),
+            LivepeerHTTPError(402, "https://callback.example.com"),
+        ],
+    )
+    async def test_callback_errors_abort_without_retry(
+        self, payment_call, error
+    ) -> None:
+        callback = mock.AsyncMock(side_effect=error)
+        with pytest.raises(type(error)) as raised:
+            await call_runner(**payment_call.kwargs, on_payment_session=callback)
+        assert raised.value is error
+        assert raised.value.__context__ is None
+        assert (
+            payment_call.transport.await_count == payment_call.signer.await_count == 1
+        )
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            LivepeerHTTPError(403, "https://signer.example.com"),
+            {"segCreds": "segment", "state": {}},
+        ],
+    )
+    async def test_signer_failure_does_not_report(self, payment_call, outcome) -> None:
+        if isinstance(outcome, Exception):
+            payment_call.signer.side_effect = outcome
+        else:
+            payment_call.signer.return_value = outcome
+        callback = mock.Mock()
+        with pytest.raises(LivepeerGatewayError):
+            await call_runner(**payment_call.kwargs, on_payment_session=callback)
+        callback.assert_not_called()
+        assert payment_call.transport.await_count == 1
+
+    @pytest.mark.parametrize(
+        ("outcome", "error_type", "message"),
+        [
+            (
+                {"payment": "payment", "state": {}},
+                LivepeerGatewayError,
+                "Live runner payment response missing segCreds",
+            ),
+            (
+                {"payment": "payment", "segCreds": None, "state": {}},
+                LivepeerGatewayError,
+                "Live runner payment response missing segCreds",
+            ),
+            (
+                {"payment": "payment", "segCreds": "", "state": {}},
+                LivepeerGatewayError,
+                "Live runner payment response missing segCreds",
+            ),
+            (
+                {"payment": "payment", "segCreds": 123, "state": {}},
+                PaymentError,
+                "invalid 'segCreds'",
+            ),
+            (
+                {"payment": "payment", "segCreds": "segment"},
+                PaymentError,
+                "missing 'state'",
+            ),
+        ],
+    )
+    async def test_signed_unusable_response_reports_before_failing(
+        self, payment_call, outcome, error_type, message
+    ) -> None:
+        payment_call.signer.return_value = outcome
+        callback = mock.Mock()
+        with pytest.raises(error_type, match=message) as raised:
+            await call_runner(**payment_call.kwargs, on_payment_session=callback)
+        assert isinstance(raised.value, error_type)
+        if error_type is LivepeerGatewayError:
+            assert type(raised.value) is LivepeerGatewayError
+        callback.assert_called_once()
+        assert payment_call.transport.await_count == 1
+
+    @pytest.mark.parametrize("seg_creds", [None, ""])
+    async def test_blank_segment_keeps_the_runner_error_without_a_callback(
+        self, payment_call, seg_creds
+    ) -> None:
+        payment_call.signer.return_value = {
+            "payment": "payment",
+            "segCreds": seg_creds,
+            "state": {"cursor": "advanced"},
+        }
+        with pytest.raises(
+            LivepeerGatewayError,
+            match="Live runner payment response missing segCreds",
+        ) as raised:
+            await call_runner(**payment_call.kwargs)
+        assert type(raised.value) is LivepeerGatewayError
+        assert payment_call.transport.await_count == 1
+
+    async def test_paid_request_failure_preserves_notification(
+        self, payment_call
+    ) -> None:
+        call = payment_call
+        error = LivepeerHTTPError(500, "https://runner.example.com")
+        call.transport.side_effect = [call.challenge("manifest-1"), error]
+        sessions: list[LivePaymentSession] = []
+        with pytest.raises(LivepeerHTTPError) as raised:
+            await call_runner(**call.kwargs, on_payment_session=sessions.append)
+        assert raised.value is error
+        assert [s.manifest_id for s in sessions] == ["manifest-1"]
+
+    @pytest.mark.parametrize("phase", ["signing", "callback"])
+    async def test_cancellation_waits_for_reporting(self, payment_call, phase) -> None:
+        call = payment_call
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def block(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return call.signer.return_value
+
+        callback = mock.AsyncMock(side_effect=block if phase == "callback" else None)
+        if phase == "signing":
+            call.signer.side_effect = block
+        task = asyncio.create_task(
+            call_runner(**call.kwargs, on_payment_session=callback)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert callback.await_count == 1
+            assert call.transport.await_count == 1
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_second_cancellation_still_waits_for_reporting(
+        self, payment_call
+    ) -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def collect(_session):
+            entered.set()
+            await release.wait()
+
+        callback = mock.AsyncMock(side_effect=collect)
+        task = asyncio.create_task(
+            call_runner(**payment_call.kwargs, on_payment_session=callback)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            callback.assert_awaited_once()
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancelled_signed_unusable_response_is_reported(
+        self, payment_call
+    ) -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+        payment_call.signer.return_value = {
+            "payment": "payment",
+            "segCreds": "segment",
+        }
+
+        async def sign(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return payment_call.signer.return_value
+
+        payment_call.signer.side_effect = sign
+        callback = mock.Mock()
+        task = asyncio.create_task(
+            call_runner(**payment_call.kwargs, on_payment_session=callback)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            callback.assert_called_once()
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_callback_failure_wins_over_cancellation(self, payment_call) -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+        error = RuntimeError("failed")
+
+        async def fail(_session):
+            entered.set()
+            await release.wait()
+            raise error
+
+        task = asyncio.create_task(
+            call_runner(
+                **payment_call.kwargs,
+                on_payment_session=fail,
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(RuntimeError) as raised:
+                await task
+            assert raised.value is error
+            assert raised.value.__context__ is None
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 def _payment_challenge_body(manifest_id: str) -> str:

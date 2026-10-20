@@ -18,6 +18,11 @@ _LOG = logging.getLogger(__name__)
 # Must stay under the signer's opening payment of 10 seconds.
 PAYMENT_INTERVAL_S = 3.0
 
+
+class _SignedPaymentError(PaymentError):
+    """The signer returned a payment string but an unusable response."""
+
+
 @dataclass(frozen=True)
 class GetPaymentResponse:
     payment: str
@@ -131,6 +136,11 @@ class LivePaymentSession:
         self._max_refresh_retries = max(0, int(max_refresh_retries))
         self._state: dict[str, Any] | None = None
 
+    @property
+    def manifest_id(self) -> str:
+        """The manifest ID of the payment challenge for this session."""
+        return self._challenge.manifest_id
+
     async def get_payment(self) -> GetPaymentResponse:
         if not self._signer_url:
             return GetPaymentResponse(payment="", seg_creds=None)
@@ -220,14 +230,17 @@ class LivePaymentSession:
             )
 
         seg_creds = data.get("segCreds")
+        # A non-string segment is unusable and carries no cursor. A blank one
+        # (missing or "") can still advance the signer's state, so store that
+        # before the caller refuses to send it.
         if seg_creds is not None and not isinstance(seg_creds, str):
-            raise PaymentError(
+            raise _SignedPaymentError(
                 f"GetPayment error: invalid 'segCreds' in response (url={url})"
             )
 
         state = data.get("state")
         if not isinstance(state, dict):
-            raise PaymentError(
+            raise _SignedPaymentError(
                 f"Remote signer response missing 'state' object (url={url})"
             )
 

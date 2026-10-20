@@ -7,6 +7,7 @@ import pytest
 
 from livepeer_gateway.errors import (
     LivepeerHTTPError,
+    PaymentError,
     SignerRefreshRequired,
 )
 from livepeer_gateway.remote_signer import (
@@ -268,6 +269,61 @@ class TestLivePaymentSession:
         assert calls[4][1]["orchestrator"] == "new-payment-params"
 
         assert session._challenge.payment_url == _PAYMENT_URL
+        assert session.manifest_id == "manifest-1"
+
+    @pytest.mark.parametrize("seg_creds", [None, ""])
+    async def test_blank_segment_renewal_sends_the_new_cursor(
+        self, seg_creds: str | None
+    ) -> None:
+        calls: list[dict[str, object]] = []
+        responses = [
+            {
+                "payment": "payment-1",
+                "segCreds": "segment-1",
+                "state": {"cursor": "previous"},
+            },
+            {
+                "payment": "payment-2",
+                "segCreds": seg_creds,
+                "state": {"cursor": "advanced"},
+            },
+            {
+                "payment": "payment-3",
+                "segCreds": "segment-3",
+                "state": {"cursor": "later"},
+            },
+        ]
+
+        async def _post_json(
+            url: str,
+            payload: dict[str, object],
+            *,
+            headers: dict[str, str] | None = None,
+            timeout: float = 5.0,
+        ) -> dict[str, object]:
+            del url, headers, timeout
+            calls.append(payload)
+            return responses[len(calls) - 1]
+
+        post_empty = mock.AsyncMock()
+        with (
+            mock.patch("livepeer_gateway.http.post_json", side_effect=_post_json),
+            mock.patch("livepeer_gateway.http._post_empty", post_empty),
+        ):
+            session = LivePaymentSession(
+                "https://signer.example.com",
+                type="live",
+                challenge=_challenge(),
+            )
+            await session.send_payment()
+            with pytest.raises(PaymentError, match="no segCreds"):
+                await session.send_payment()
+            await session.send_payment()
+
+        assert post_empty.await_count == 2
+        assert "state" not in calls[0]
+        assert calls[1]["state"] == {"cursor": "previous"}
+        assert calls[2]["state"] == {"cursor": "advanced"}
 
     async def test_get_signer_info_caches_result(self) -> None:
         calls: list[tuple[str, dict[str, object]]] = []
