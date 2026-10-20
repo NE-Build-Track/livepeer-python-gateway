@@ -874,6 +874,10 @@ async def call_runner(
             if isinstance(payment_outcome, _PaymentSessionCallbackFailure):
                 raise payment_outcome.error
             payment = payment_outcome
+            if not payment.seg_creds:
+                raise LivepeerGatewayError(
+                    "Live runner payment response missing segCreds"
+                )
             request_headers["Livepeer-Payment"] = payment.payment
             request_headers["Livepeer-Segment"] = cast(str, payment.seg_creds)
             session_id = challenge.manifest_id

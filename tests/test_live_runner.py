@@ -755,23 +755,63 @@ class TestPaymentSessionCallback:
         assert payment_call.transport.await_count == 1
 
     @pytest.mark.parametrize(
-        "outcome",
+        ("outcome", "error_type", "message"),
         [
-            {"payment": "payment", "state": {}},
-            {"payment": "payment", "segCreds": None, "state": {}},
-            {"payment": "payment", "segCreds": "", "state": {}},
-            {"payment": "payment", "segCreds": 123, "state": {}},
-            {"payment": "payment", "segCreds": "segment"},
+            (
+                {"payment": "payment", "state": {}},
+                LivepeerGatewayError,
+                "Live runner payment response missing segCreds",
+            ),
+            (
+                {"payment": "payment", "segCreds": None, "state": {}},
+                LivepeerGatewayError,
+                "Live runner payment response missing segCreds",
+            ),
+            (
+                {"payment": "payment", "segCreds": "", "state": {}},
+                LivepeerGatewayError,
+                "Live runner payment response missing segCreds",
+            ),
+            (
+                {"payment": "payment", "segCreds": 123, "state": {}},
+                PaymentError,
+                "invalid 'segCreds'",
+            ),
+            (
+                {"payment": "payment", "segCreds": "segment"},
+                PaymentError,
+                "missing 'state'",
+            ),
         ],
     )
     async def test_signed_unusable_response_reports_before_failing(
-        self, payment_call, outcome
+        self, payment_call, outcome, error_type, message
     ) -> None:
         payment_call.signer.return_value = outcome
         callback = mock.Mock()
-        with pytest.raises(PaymentError):
+        with pytest.raises(error_type, match=message) as raised:
             await call_runner(**payment_call.kwargs, on_payment_session=callback)
+        assert isinstance(raised.value, error_type)
+        if error_type is LivepeerGatewayError:
+            assert type(raised.value) is LivepeerGatewayError
         callback.assert_called_once()
+        assert payment_call.transport.await_count == 1
+
+    @pytest.mark.parametrize("seg_creds", [None, ""])
+    async def test_blank_segment_keeps_the_runner_error_without_a_callback(
+        self, payment_call, seg_creds
+    ) -> None:
+        payment_call.signer.return_value = {
+            "payment": "payment",
+            "segCreds": seg_creds,
+            "state": {"cursor": "advanced"},
+        }
+        with pytest.raises(
+            LivepeerGatewayError,
+            match="Live runner payment response missing segCreds",
+        ) as raised:
+            await call_runner(**payment_call.kwargs)
+        assert type(raised.value) is LivepeerGatewayError
         assert payment_call.transport.await_count == 1
 
     async def test_paid_request_failure_preserves_notification(

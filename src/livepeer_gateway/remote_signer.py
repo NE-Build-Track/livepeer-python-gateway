@@ -171,6 +171,10 @@ class LivePaymentSession:
         from .http import _post_empty
 
         payment = await self.get_payment()
+        if not payment.seg_creds:
+            # An empty segment header fails the orchestrator's sig check and
+            # comes back 403, which reads as a dead session, not a bad signer.
+            raise PaymentError("Signer returned a payment with no segCreds")
         headers = {
             "Livepeer-Payment": payment.payment,
             "Livepeer-Segment": payment.seg_creds,
@@ -226,7 +230,10 @@ class LivePaymentSession:
             )
 
         seg_creds = data.get("segCreds")
-        if not isinstance(seg_creds, str) or not seg_creds:
+        # A non-string segment is unusable and carries no cursor. A blank one
+        # (missing or "") can still advance the signer's state, so store that
+        # before the caller refuses to send it.
+        if seg_creds is not None and not isinstance(seg_creds, str):
             raise _SignedPaymentError(
                 f"GetPayment error: invalid 'segCreds' in response (url={url})"
             )
