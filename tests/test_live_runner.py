@@ -13,6 +13,7 @@ from livepeer_gateway import live_runner
 from livepeer_gateway.errors import (
     LivepeerGatewayError,
     LivepeerHTTPError,
+    PaymentError,
     SignerRefreshRequired,
 )
 from livepeer_gateway.live_runner import (
@@ -740,10 +741,6 @@ class TestPaymentSessionCallback:
         [
             LivepeerHTTPError(403, "https://signer.example.com"),
             {"segCreds": "segment", "state": {}},
-            {"payment": "payment", "state": {}},
-            {"payment": "payment", "segCreds": None, "state": {}},
-            {"payment": "payment", "segCreds": "", "state": {}},
-            {"payment": "payment", "segCreds": 123, "state": {}},
         ],
     )
     async def test_signer_failure_does_not_report(self, payment_call, outcome) -> None:
@@ -755,6 +752,26 @@ class TestPaymentSessionCallback:
         with pytest.raises(LivepeerGatewayError):
             await call_runner(**payment_call.kwargs, on_payment_session=callback)
         callback.assert_not_called()
+        assert payment_call.transport.await_count == 1
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            {"payment": "payment", "state": {}},
+            {"payment": "payment", "segCreds": None, "state": {}},
+            {"payment": "payment", "segCreds": "", "state": {}},
+            {"payment": "payment", "segCreds": 123, "state": {}},
+            {"payment": "payment", "segCreds": "segment"},
+        ],
+    )
+    async def test_signed_unusable_response_reports_before_failing(
+        self, payment_call, outcome
+    ) -> None:
+        payment_call.signer.return_value = outcome
+        callback = mock.Mock()
+        with pytest.raises(PaymentError):
+            await call_runner(**payment_call.kwargs, on_payment_session=callback)
+        callback.assert_called_once()
         assert payment_call.transport.await_count == 1
 
     async def test_paid_request_failure_preserves_notification(
@@ -770,7 +787,7 @@ class TestPaymentSessionCallback:
         assert [s.manifest_id for s in sessions] == ["manifest-1"]
 
     @pytest.mark.parametrize("phase", ["signing", "callback"])
-    async def test_cancellation_remains_prompt(self, payment_call, phase) -> None:
+    async def test_cancellation_waits_for_reporting(self, payment_call, phase) -> None:
         call = payment_call
         entered, release = asyncio.Event(), asyncio.Event()
 
@@ -788,12 +805,103 @@ class TestPaymentSessionCallback:
         try:
             await asyncio.wait_for(entered.wait(), timeout=1)
             task.cancel()
-            done, _ = await asyncio.wait([task], timeout=1)
-            assert task in done
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert callback.await_count == (1 if phase == "callback" else 0)
+            assert callback.await_count == 1
             assert call.transport.await_count == 1
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_second_cancellation_still_waits_for_reporting(
+        self, payment_call
+    ) -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def collect(_session):
+            entered.set()
+            await release.wait()
+
+        callback = mock.AsyncMock(side_effect=collect)
+        task = asyncio.create_task(
+            call_runner(**payment_call.kwargs, on_payment_session=callback)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            callback.assert_awaited_once()
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancelled_signed_unusable_response_is_reported(
+        self, payment_call
+    ) -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+        payment_call.signer.return_value = {
+            "payment": "payment",
+            "segCreds": "segment",
+        }
+
+        async def sign(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return payment_call.signer.return_value
+
+        payment_call.signer.side_effect = sign
+        callback = mock.Mock()
+        task = asyncio.create_task(
+            call_runner(**payment_call.kwargs, on_payment_session=callback)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            callback.assert_called_once()
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_callback_failure_wins_over_cancellation(self, payment_call) -> None:
+        entered, release = asyncio.Event(), asyncio.Event()
+        error = RuntimeError("failed")
+
+        async def fail(_session):
+            entered.set()
+            await release.wait()
+            raise error
+
+        task = asyncio.create_task(
+            call_runner(
+                **payment_call.kwargs,
+                on_payment_session=fail,
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(RuntimeError) as raised:
+                await task
+            assert raised.value is error
+            assert raised.value.__context__ is None
         finally:
             release.set()
             task.cancel()

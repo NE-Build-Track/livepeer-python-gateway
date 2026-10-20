@@ -30,8 +30,10 @@ from .channel_reader import ChannelReader
 from .errors import LivepeerGatewayError, LivepeerHTTPError, SignerRefreshRequired
 from .http import _post_empty, _request_body, open_stream, post_json, request_json
 from .remote_signer import (
+    GetPaymentResponse,
     LivePaymentChallenge,
     LivePaymentSession,
+    _SignedPaymentError,
     _freeze_headers,
     get_signer_info,
 )
@@ -87,6 +89,11 @@ class LiveRunnerSessionEvent:
 
 LiveRunnerSessionCallback = Callable[[LiveRunnerSessionEvent], None | Awaitable[None]]
 LivePaymentSessionCallback = Callable[[LivePaymentSession], None | Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class _PaymentSessionCallbackFailure:
+    error: BaseException
 
 
 @dataclass(frozen=True)
@@ -806,9 +813,10 @@ async def call_runner(
     paid via the signer and retried (up to ``max_payment_challenge_retries``), one job,
     one upfront payment. Raises ``LivepeerHTTPError`` on non-402 errors.
 
-    After a new payment session is obtained, `on_payment_session` is called.
+    After a payment string is obtained, `on_payment_session` is called.
     Metered renewals do not invoke it. The callback may be sync or
-    async. Its exceptions propagate and abort the call.
+    async. Its exceptions propagate and abort the call. Cancellation waits for
+    an in-progress signer request and callback; callback errors still propagate.
 
     ``application/json`` and ``+json`` types parse into ``result.data``; anything else
     (an image, ndjson) comes back unparsed in ``result.content`` + ``result.content_type``.
@@ -849,7 +857,10 @@ async def call_runner(
                 max_price=max_price.to_json() if max_price is not None else None,
             )
             try:
-                payment = await payment_session.get_payment()
+                payment_outcome = await _await_runner_payment(
+                    payment_session,
+                    on_payment_session=on_payment_session,
+                )
             except SignerRefreshRequired as e:
                 if attempt + 1 >= attempts:
                     raise
@@ -860,12 +871,11 @@ async def call_runner(
                 )
                 challenge = None
                 continue
-            if on_payment_session is not None:
-                result = on_payment_session(payment_session)
-                if inspect.isawaitable(result):
-                    await result
+            if isinstance(payment_outcome, _PaymentSessionCallbackFailure):
+                raise payment_outcome.error
+            payment = payment_outcome
             request_headers["Livepeer-Payment"] = payment.payment
-            request_headers["Livepeer-Segment"] = payment.seg_creds
+            request_headers["Livepeer-Segment"] = cast(str, payment.seg_creds)
             session_id = challenge.manifest_id
 
             # Metered pricing bills for as long as the work runs.
@@ -950,6 +960,77 @@ async def call_runner(
             continue
 
     raise LivepeerGatewayError("Live runner call exhausted payment challenge retries")
+
+
+async def _await_runner_payment(
+    payment_session: LivePaymentSession,
+    *,
+    on_payment_session: LivePaymentSessionCallback | None,
+) -> GetPaymentResponse | _PaymentSessionCallbackFailure:
+    if on_payment_session is None:
+        return await payment_session.get_payment()
+
+    async def _pay_and_report() -> GetPaymentResponse | _PaymentSessionCallbackFailure:
+        try:
+            payment_outcome = await payment_session.get_payment()
+        except _SignedPaymentError as error:
+            payment_outcome = error
+        callback_error = await _notify_payment_session(
+            on_payment_session,
+            payment_session,
+        )
+        if callback_error is not None:
+            return _PaymentSessionCallbackFailure(callback_error)
+        if isinstance(payment_outcome, _SignedPaymentError):
+            raise payment_outcome
+        return payment_outcome
+
+    payment_task = asyncio.create_task(_pay_and_report())
+    waiter = asyncio.gather(payment_task, return_exceptions=True)
+    cancelled = False
+    while not waiter.done():
+        try:
+            await asyncio.shield(waiter)
+        # Reporting must finish even if the caller cancels more than once.
+        except asyncio.CancelledError:  # NOSONAR
+            cancelled = True
+
+    return _runner_payment_result(payment_task, cancelled=cancelled)
+
+
+def _runner_payment_result(
+    payment_task: asyncio.Task[
+        GetPaymentResponse | _PaymentSessionCallbackFailure
+    ],
+    *,
+    cancelled: bool,
+) -> GetPaymentResponse | _PaymentSessionCallbackFailure:
+    if payment_task.cancelled():
+        raise asyncio.CancelledError
+    error = payment_task.exception()
+    if error is not None:
+        if cancelled:
+            raise asyncio.CancelledError
+        raise error
+    result = payment_task.result()
+    if isinstance(result, _PaymentSessionCallbackFailure):
+        return result
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+async def _notify_payment_session(
+    callback: LivePaymentSessionCallback,
+    payment_session: LivePaymentSession,
+) -> BaseException | None:
+    try:
+        result = callback(payment_session)
+        if inspect.isawaitable(result):
+            await result
+    except (Exception, asyncio.CancelledError) as error:
+        return error
+    return None
 
 
 def _parse_runner_payment_challenge(error: LivepeerHTTPError) -> LivePaymentChallenge:

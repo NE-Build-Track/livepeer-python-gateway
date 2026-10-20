@@ -18,6 +18,11 @@ _LOG = logging.getLogger(__name__)
 # Must stay under the signer's opening payment of 10 seconds.
 PAYMENT_INTERVAL_S = 3.0
 
+
+class _SignedPaymentError(PaymentError):
+    """The signer returned a payment string but an unusable response."""
+
+
 @dataclass(frozen=True)
 class GetPaymentResponse:
     payment: str
@@ -222,13 +227,13 @@ class LivePaymentSession:
 
         seg_creds = data.get("segCreds")
         if not isinstance(seg_creds, str) or not seg_creds:
-            raise PaymentError(
+            raise _SignedPaymentError(
                 f"GetPayment error: invalid 'segCreds' in response (url={url})"
             )
 
         state = data.get("state")
         if not isinstance(state, dict):
-            raise PaymentError(
+            raise _SignedPaymentError(
                 f"Remote signer response missing 'state' object (url={url})"
             )
 
