@@ -30,7 +30,6 @@ from .channel_reader import ChannelReader
 from .errors import LivepeerGatewayError, LivepeerHTTPError, SignerRefreshRequired
 from .http import _post_empty, _request_body, open_stream, post_json, request_json
 from .remote_signer import (
-    GetPaymentResponse,
     LivePaymentChallenge,
     LivePaymentSession,
     _freeze_headers,
@@ -762,6 +761,7 @@ async def call_runner(
     payment_unit: str | None = ...,
     timeout: float = ...,
     max_payment_challenge_retries: int = ...,
+    on_payment_session: Callable[[LivePaymentSession], None | Awaitable[None]] | None = ...,
     stream: Literal[False] = False,
 ) -> LiveRunnerCallResult:
     pass
@@ -779,6 +779,7 @@ async def call_runner(
     payment_unit: str | None = ...,
     timeout: float = ...,
     max_payment_challenge_retries: int = ...,
+    on_payment_session: Callable[[LivePaymentSession], None | Awaitable[None]] | None = ...,
     stream: Literal[True],
 ) -> LiveRunnerCallStream:
     pass
@@ -795,6 +796,7 @@ async def call_runner(
     payment_unit: str | None = None,
     timeout: float = 5.0,
     max_payment_challenge_retries: int = 3,
+    on_payment_session: Callable[[LivePaymentSession], None | Awaitable[None]] | None = None,
     stream: bool = False,
 ) -> LiveRunnerCallResult | LiveRunnerCallStream:
     """Call a runner once and return its result (or a live stream if ``stream=True``).
@@ -802,6 +804,10 @@ async def call_runner(
     With ``signer_url`` set, payment is automatic and **per call**: a 402 challenge is
     paid via the signer and retried (up to ``max_payment_challenge_retries``), one job,
     one upfront payment. Raises ``LivepeerHTTPError`` on non-402 errors.
+
+    After a new payment session is obtained, `on_payment_session` is called.
+    Metered renewals do not invoke it. The callback may be sync or
+    async. Its exceptions propagate and abort the call.
 
     ``application/json`` and ``+json`` types parse into ``result.data``; anything else
     (an image, ndjson) comes back unparsed in ``result.content`` + ``result.content_type``.
@@ -833,15 +839,16 @@ async def call_runner(
             request_headers[_LIVE_RUNNER_PAYER_ADDRESS_HEADER] = payer_address
         # Pending challenge means payment is needed.
         if challenge is not None:
+            payment_session = LivePaymentSession(
+                signer_url=signer_url or "",
+                signer_headers=signer_headers,
+                type=payment_type,
+                challenge=challenge,
+                app=runner.app if runner is not None else None,
+                max_price=max_price.to_json() if max_price is not None else None,
+            )
             try:
-                payment_session, payment = await _get_runner_payment(
-                    challenge,
-                    payment_type=payment_type,
-                    app=runner.app if runner is not None else None,
-                    signer_url=signer_url or "",
-                    signer_headers=signer_headers,
-                    max_price=max_price,
-                )
+                payment = await payment_session.get_payment()
             except SignerRefreshRequired as e:
                 if attempt + 1 >= attempts:
                     raise
@@ -852,8 +859,12 @@ async def call_runner(
                 )
                 challenge = None
                 continue
+            if on_payment_session is not None:
+                result = on_payment_session(payment_session)
+                if inspect.isawaitable(result):
+                    await result
             request_headers["Livepeer-Payment"] = payment.payment
-            request_headers["Livepeer-Segment"] = payment.seg_creds or ""
+            request_headers["Livepeer-Segment"] = payment.seg_creds
             session_id = challenge.manifest_id
 
             # Metered pricing bills for as long as the work runs.
@@ -986,31 +997,6 @@ async def _stop_funding(task: asyncio.Task[None] | None) -> None:
         task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
-
-
-async def _get_runner_payment(
-    challenge: LivePaymentChallenge,
-    *,
-    payment_type: str,
-    signer_url: str,
-    signer_headers: dict[str, str] | None,
-    max_price: LiveRunnerPriceInfo | None,
-    app: str | None = None,
-) -> tuple[LivePaymentSession, GetPaymentResponse]:
-    session = LivePaymentSession(
-        signer_url=signer_url,
-        signer_headers=signer_headers,
-        type=payment_type,
-        challenge=challenge,
-        app=app,
-        max_price=max_price.to_json() if max_price is not None else None,
-    )
-    payment = await session.get_payment()
-    if not payment.payment:
-        raise LivepeerGatewayError("Live runner payment response missing payment")
-    if not payment.seg_creds:
-        raise LivepeerGatewayError("Live runner payment response missing segCreds")
-    return session, payment
 
 
 def _runner_payment_type(

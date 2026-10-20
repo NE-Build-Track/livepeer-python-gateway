@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `call_runner(on_payment_session=...)` callback for each new payment session
+- `LivePaymentSession.manifest_id` for payment attribution
+
 ### Changed
 
 - `discover_orchestrators` is now asynchronous and must be awaited, including
