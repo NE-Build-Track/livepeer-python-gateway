@@ -131,6 +131,11 @@ class LivePaymentSession:
         self._max_refresh_retries = max(0, int(max_refresh_retries))
         self._state: dict[str, Any] | None = None
 
+    @property
+    def manifest_id(self) -> str:
+        """The manifest ID of the payment challenge for this session."""
+        return self._challenge.manifest_id
+
     async def get_payment(self) -> GetPaymentResponse:
         if not self._signer_url:
             return GetPaymentResponse(payment="", seg_creds=None)
@@ -161,10 +166,6 @@ class LivePaymentSession:
         from .http import _post_empty
 
         payment = await self.get_payment()
-        if not payment.seg_creds:
-            # An empty segment header fails the orchestrator's sig check and
-            # comes back 403, which reads as a dead session, not a bad signer.
-            raise PaymentError("Signer returned a payment with no segCreds")
         headers = {
             "Livepeer-Payment": payment.payment,
             "Livepeer-Segment": payment.seg_creds,
@@ -220,7 +221,7 @@ class LivePaymentSession:
             )
 
         seg_creds = data.get("segCreds")
-        if seg_creds is not None and not isinstance(seg_creds, str):
+        if not isinstance(seg_creds, str) or not seg_creds:
             raise PaymentError(
                 f"GetPayment error: invalid 'segCreds' in response (url={url})"
             )

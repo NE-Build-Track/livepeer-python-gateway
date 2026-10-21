@@ -33,8 +33,8 @@ CHALLENGE = {
 @pytest.fixture
 def signer(monkeypatch):
     monkeypatch.setattr(live_runner, "get_signer_info", mock.AsyncMock(return_value=SimpleNamespace(address="payer")))
-    payment = mock.AsyncMock(return_value=(None, SimpleNamespace(payment="paid", seg_creds="segment")))
-    monkeypatch.setattr(live_runner, "_get_runner_payment", payment)
+    payment = mock.AsyncMock(return_value={"payment": "paid", "segCreds": "segment", "state": {}})
+    monkeypatch.setattr("livepeer_gateway.http.post_json", payment)
     return payment
 
 
@@ -207,6 +207,7 @@ async def test_early_payment_challenge_does_not_touch_source(
 ):
     source = Source(b"one", b"two")
     attempts = 0
+    sessions = []
 
     async def handler(reader, writer):
         nonlocal attempts
@@ -219,6 +220,7 @@ async def test_early_payment_challenge_does_not_touch_source(
             assert await reader.read() == b""
             return
         assert request_headers["Livepeer-Payment"] == "paid"
+        assert [session.manifest_id for session in sessions] == [CHALLENGE["manifest_id"]]
         assert source.iterations == source.reads == 0
         await allow_upload(writer)
         assert await body(reader, request_headers) == b"onetwo"
@@ -234,6 +236,7 @@ async def test_early_payment_challenge_does_not_touch_source(
                 payload=StreamPayload(source=source, retry_buffer=False),
                 signer_url="http://signer.example",
                 payment_unit="fixed",
+                on_payment_session=sessions.append,
                 stream=stream,
             ),
             2,
@@ -244,10 +247,9 @@ async def test_early_payment_challenge_does_not_touch_source(
     assert source.reads == 3
     assert not source.closed
     signer.assert_awaited_once()
-    challenge = signer.call_args.args[0]
-    assert challenge.payment_params == CHALLENGE["payment_params"]
-    assert challenge.manifest_id == CHALLENGE["manifest_id"]
-    assert challenge.payment_url == CHALLENGE["payment_url"]
+    payment_request = signer.call_args.args[1]
+    assert payment_request["orchestrator"] == CHALLENGE["payment_params"]
+    assert payment_request["ManifestID"] == CHALLENGE["manifest_id"]
 
 
 @pytest.mark.parametrize("status,kind", [(402, "nonseekable"), (503, "iterator"), (307, "file")])

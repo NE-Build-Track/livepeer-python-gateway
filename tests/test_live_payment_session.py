@@ -268,6 +268,7 @@ class TestLivePaymentSession:
         assert calls[4][1]["orchestrator"] == "new-payment-params"
 
         assert session._challenge.payment_url == _PAYMENT_URL
+        assert session.manifest_id == "manifest-1"
 
     async def test_get_signer_info_caches_result(self) -> None:
         calls: list[tuple[str, dict[str, object]]] = []
