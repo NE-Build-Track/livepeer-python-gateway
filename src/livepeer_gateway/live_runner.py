@@ -169,9 +169,22 @@ class LiveRunnerCallResult:
         repr=False,
         compare=False,
     )
+    payment_sessions: tuple[LivePaymentSession, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
     # Non-JSON responses (an image, say) arrive unparsed in `content`; `data` stays empty.
     content: bytes | None = field(default=None, repr=False)
     content_type: str = ""
+
+    @property
+    def payment_sent(self) -> bool:
+        return bool(self.payment_sessions)
+
+    @property
+    def manifest_ids(self) -> tuple[str, ...]:
+        return tuple(s.manifest_id for s in self.payment_sessions if s.manifest_id)
 
 
 @dataclass
@@ -190,6 +203,11 @@ class LiveRunnerCallStream:
     payment_session: LivePaymentSession | None
     _session: aiohttp.ClientSession = field(repr=False, compare=False)
     _response: aiohttp.ClientResponse = field(repr=False, compare=False)
+    payment_sessions: tuple[LivePaymentSession, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
     _payload_state: _StreamState | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -198,6 +216,14 @@ class LiveRunnerCallStream:
     _payment_task: asyncio.Task[None] | None = field(
         default=None, repr=False, compare=False
     )
+
+    @property
+    def payment_sent(self) -> bool:
+        return bool(self.payment_sessions)
+
+    @property
+    def manifest_ids(self) -> tuple[str, ...]:
+        return tuple(s.manifest_id for s in self.payment_sessions if s.manifest_id)
 
     @property
     def content_type(self) -> str:
@@ -832,6 +858,7 @@ async def call_runner(
     state = _stream_state(payload)
     owned = state is not None and not isinstance(payload, _StreamState)
     payload = state if state is not None else payload
+    signed_sessions: list[LivePaymentSession] = []
     try:
         runner_url = runner_url.strip() or (runner.url.strip() if runner is not None else "")
         if not runner_url:
@@ -879,6 +906,8 @@ async def call_runner(
                     )
                     challenge = None
                     continue
+                if payment_session is not None:
+                    signed_sessions.append(payment_session)
                 if on_payment_session is not None:
                     result = on_payment_session(payment_session)
                     if inspect.isawaitable(result):
@@ -908,6 +937,7 @@ async def call_runner(
                         None if payment_type == "fixed" else payment_session,
                         session,
                         resp,
+                        payment_sessions=tuple(signed_sessions),
                     )
                     # The stream outlives this call, so it owns the funding.
                     if needs_ongoing_funding:
@@ -957,6 +987,7 @@ async def call_runner(
                         or (data["session_id"].strip() if isinstance(data.get("session_id"), str) else "")
                     ),
                     payment_session=None if payment_type == "fixed" else payment_session,
+                    payment_sessions=tuple(signed_sessions),
                     content=None if is_json else body,
                     content_type=response_content_type,
                 )
@@ -971,6 +1002,9 @@ async def call_runner(
                 continue
 
         raise LivepeerGatewayError("Live runner call exhausted payment challenge retries")
+    except LivepeerGatewayError as e:
+        e.payment_sessions = tuple(signed_sessions)
+        raise
     finally:
         if owned:
             await state.aclose()

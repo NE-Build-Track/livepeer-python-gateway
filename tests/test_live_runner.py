@@ -710,6 +710,9 @@ class TestPaymentSessionCallback:
         if call.kwargs["stream"]:
             await result.aclose()
         assert [s.manifest_id for s in sessions] == ["manifest-1", "manifest-2"]
+        assert result.payment_sessions == tuple(sessions)
+        assert result.payment_sent is True
+        assert result.manifest_ids == ("manifest-1", "manifest-2")
         assert result.payment_session is (
             sessions[-1] if payment_unit == "seconds" else None
         )
@@ -731,6 +734,9 @@ class TestPaymentSessionCallback:
             await call_runner(**payment_call.kwargs, on_payment_session=callback)
         assert raised.value is error
         assert raised.value.__context__ is None
+        if isinstance(error, LivepeerGatewayError):
+            assert raised.value.payment_sent is True
+            assert raised.value.manifest_ids == ("manifest-1",)
         assert (
             payment_call.transport.await_count == payment_call.signer.await_count == 1
         )
@@ -752,22 +758,47 @@ class TestPaymentSessionCallback:
         else:
             payment_call.signer.return_value = outcome
         callback = mock.Mock()
-        with pytest.raises(LivepeerGatewayError):
+        with pytest.raises(LivepeerGatewayError) as raised:
             await call_runner(**payment_call.kwargs, on_payment_session=callback)
         callback.assert_not_called()
+        assert raised.value.payment_sessions == ()
+        assert raised.value.payment_sent is False
+        assert raised.value.manifest_ids == ()
         assert payment_call.transport.await_count == 1
 
-    async def test_paid_request_failure_preserves_notification(
+    @pytest.mark.parametrize("payment_call", [False, True], indirect=True)
+    async def test_paid_request_failure_preserves_notification_and_error_sessions(
         self, payment_call
     ) -> None:
         call = payment_call
         error = LivepeerHTTPError(500, "https://runner.example.com")
-        call.transport.side_effect = [call.challenge("manifest-1"), error]
+        call.transport.side_effect = [
+            call.challenge("manifest-1"),
+            call.challenge("manifest-2"),
+            error,
+        ]
         sessions: list[LivePaymentSession] = []
         with pytest.raises(LivepeerHTTPError) as raised:
             await call_runner(**call.kwargs, on_payment_session=sessions.append)
         assert raised.value is error
-        assert [s.manifest_id for s in sessions] == ["manifest-1"]
+        assert [s.manifest_id for s in sessions] == ["manifest-1", "manifest-2"]
+        assert raised.value.payment_sessions == tuple(sessions)
+        assert raised.value.payment_sent is True
+        assert raised.value.manifest_ids == ("manifest-1", "manifest-2")
+
+    async def test_exhausted_challenges_attach_signed_sessions_without_callback(
+        self, payment_call
+    ) -> None:
+        call = payment_call
+        call.kwargs["max_payment_challenge_retries"] = 0
+        call.transport.side_effect = [
+            call.challenge("manifest-1"),
+            call.challenge("manifest-2"),
+        ]
+        with pytest.raises(LivepeerGatewayError, match="exhausted payment challenge retries") as raised:
+            await call_runner(**call.kwargs)
+        assert raised.value.payment_sent is True
+        assert raised.value.manifest_ids == ("manifest-1",)
 
     @pytest.mark.parametrize("phase", ["signing", "callback"])
     async def test_cancellation_remains_prompt(self, payment_call, phase) -> None:

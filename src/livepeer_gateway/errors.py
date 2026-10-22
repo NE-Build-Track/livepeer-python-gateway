@@ -6,6 +6,16 @@ from dataclasses import dataclass
 class LivepeerGatewayError(RuntimeError):
     """Base error for the library."""
 
+    payment_sessions: tuple[LivePaymentSession, ...] = ()
+
+    @property
+    def payment_sent(self) -> bool:
+        return bool(self.payment_sessions)
+
+    @property
+    def manifest_ids(self) -> tuple[str, ...]:
+        return tuple(s.manifest_id for s in self.payment_sessions if s.manifest_id)
+
 
 class LivepeerHTTPError(LivepeerGatewayError):
     """Raised when an HTTP endpoint returns a non-success status."""
@@ -49,3 +59,6 @@ class SkipPaymentCycle(LivepeerGatewayError):
 
 class PaymentError(LivepeerGatewayError):
     """Raised when a payment operation fails."""
+
+
+from .remote_signer import LivePaymentSession  # noqa: E402

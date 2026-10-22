@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `call_runner(on_payment_session=...)` callback for each new payment session
 - `LivePaymentSession.manifest_id` for payment attribution
+- `payment_sessions`, `payment_sent`, and `manifest_ids` on `LiveRunnerCallResult`, `LiveRunnerCallStream`, and `LivepeerGatewayError`
 - Flexible request body types on call_runner and selectors.
 
 ### Changed
