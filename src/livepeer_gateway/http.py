@@ -235,6 +235,7 @@ async def open_stream(
     payload: RunnerPayload | _StreamState = None,
     headers: dict[str, str] | None = None,
     connect_timeout: float = 10.0,
+    return_http_errors: bool = False,
 ) -> tuple[aiohttp.ClientSession, aiohttp.ClientResponse]:
     """
     Open an HTTP request and return the live (session, response) without reading the
@@ -242,13 +243,15 @@ async def open_stream(
     them.
 
     No total/read timeout; bounds connection and optional 100-continue handshake.
-    Raises LivepeerHTTPError on >= 400 (e.g. the 402 payment retry).
+    Raises LivepeerHTTPError on >= 400 by default. With return_http_errors, only
+    402 uses error control flow; redirects and automatic decompression are disabled.
     """
     try:
         return await _open_request(
             url, method=method, payload=payload, headers=headers,
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=connect_timeout, sock_read=None),
             handshake_timeout=connect_timeout,
+            return_http_errors=return_http_errors,
         )
     except (TimeoutError, aiohttp.ClientError) as e:
         raise LivepeerGatewayError(
@@ -264,16 +267,23 @@ async def _open_request(
     headers: dict[str, str] | None,
     timeout: aiohttp.ClientTimeout,
     handshake_timeout: float,
+    return_http_errors: bool = False,
 ) -> tuple[aiohttp.ClientSession, aiohttp.ClientResponse]:
     method, headers, body = _request_parts(url, method=method, payload=payload, headers=headers)
     session, options = _request_session(payload, timeout, handshake_timeout)
+    if return_http_errors:
+        # Preserve status/body boundaries. Native callers own decoding and redirects.
+        options.update(allow_redirects=False, auto_decompress=False)
+        headers["Accept-Encoding"] = "identity"
+        if hasattr(session, "_retry_connection"):
+            session._retry_connection = False
     if payload is None:
         # aiohttp otherwise adds application/octet-stream even for an empty POST.
         options["skip_auto_headers"] = {"Content-Type"}
     resp = None
     try:
         resp = await session.request(method, url, data=body, headers=headers, **options)
-        if _request_failed(resp.status, payload):
+        if resp.status == 402 or (not return_http_errors and _request_failed(resp.status, payload)):
             # Read before cancelling the writer: aiohttp 3.13 closes the socket
             # on cancellation, which can discard a fragmented payment challenge.
             raw = (await resp.content.read()).decode(errors="replace")

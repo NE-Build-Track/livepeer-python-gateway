@@ -191,3 +191,38 @@ async def upload_to_available_runner(path, discovery_url):
         ) as cursor:
             return await cursor.next()
 ```
+
+## Native protocol forwarding
+
+`call_runner(headers=...)` accepts bounded application protocol headers, such as
+`anthropic-version` or `accept`. It does not send them to the signer. Names are checked
+case-insensitively: credentials, Livepeer control headers, framing headers and duplicate
+names are rejected before signer discovery or dispatch. Use `content_type` for the media
+type. Limits are 32 headers and 16 KiB of names/values; values must be printable ASCII.
+
+For applications that need the runner's HTTP error response, use
+`stream=True, return_http_errors=True`. This returns non-402 statuses, headers (including
+repeated fields) and original body bytes without decoding JSON. It works for a JSON body
+as well as SSE: response streaming describes delivery, not the body's format.
+
+```python
+async with await call_runner(
+    runner_url,
+    payload=original_json_bytes,
+    content_type="application/json",
+    headers={"anthropic-version": "2023-06-01"},
+    stream=True,
+    return_http_errors=True,
+) as response:
+    status = response.status
+    async for chunk in response.aiter_bytes():
+        pass  # Forward through the application's authenticated, metered response path.
+```
+
+A 402 remains a payment challenge and uses the existing signer/retry path. Signer failures
+remain exceptions. Other errors are not retried merely because they are returned as a
+response. The opt-in mode disables redirects, transparent decompression and aiohttp's
+implicit connection retry, and requests identity encoding. If a server nevertheless sends
+encoded content, callers must account for that encoding when interpreting the original
+bytes. Filter upstream headers before exposing them to clients. Existing calls keep their
+error/redirect/decompression behavior. Buffered error results are not added in this change.

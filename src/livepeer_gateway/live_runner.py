@@ -36,6 +36,7 @@ from .remote_signer import (
     _freeze_headers,
     get_signer_info,
 )
+from .runner_headers import _runner_headers
 from .runner_payload import RunnerPayload, _StreamState, _stream_state
 
 _LOG = logging.getLogger(__name__)
@@ -778,6 +779,8 @@ async def call_runner(
     runner: LiveRunnerInstance | None = ...,
     payload: RunnerPayload = ...,
     content_type: str | None = ...,
+    headers: dict[str, str] | None = ...,
+    return_http_errors: bool = ...,
     method: str = ...,
     signer_url: str | None = ...,
     signer_headers: dict[str, str] | None = ...,
@@ -797,6 +800,8 @@ async def call_runner(
     runner: LiveRunnerInstance | None = ...,
     payload: RunnerPayload = ...,
     content_type: str | None = ...,
+    headers: dict[str, str] | None = ...,
+    return_http_errors: bool = ...,
     method: str = ...,
     signer_url: str | None = ...,
     signer_headers: dict[str, str] | None = ...,
@@ -815,6 +820,8 @@ async def call_runner(
     runner: LiveRunnerInstance | None = None,
     payload: RunnerPayload | _StreamState = None,
     content_type: str | None = None,
+    headers: dict[str, str] | None = None,
+    return_http_errors: bool = False,
     method: str = "POST",
     signer_url: str | None = None,
     signer_headers: dict[str, str] | None = None,
@@ -828,7 +835,10 @@ async def call_runner(
 
     With ``signer_url`` set, payment is automatic and **per call**: a 402 challenge is
     paid via the signer and retried (up to ``max_payment_challenge_retries``), one job,
-    one upfront payment. Raises ``LivepeerHTTPError`` on non-402 errors.
+    one upfront payment. Raises ``LivepeerHTTPError`` on non-402 errors by default.
+    With ``stream=True, return_http_errors=True``, return those responses unchanged;
+    402 challenges and signer errors keep their existing control flow. ``headers``
+    supplies validated application headers, separately from ``signer_headers``.
 
     After a new payment session is obtained, `on_payment_session` is called.
     Metered renewals do not invoke it. The callback may be sync or
@@ -845,6 +855,9 @@ async def call_runner(
     Omitted/None payloads send an empty body. Bare files and async byte iterables
     use StreamPayload defaults (100-continue and bounded replay buffering).
     """
+    application_headers = _runner_headers(headers)
+    if return_http_errors and not stream:
+        raise ValueError("return_http_errors requires stream=True")
     state = _stream_state(payload)
     owned = state is not None and not isinstance(payload, _StreamState)
     payload = state if state is not None else payload
@@ -869,6 +882,9 @@ async def call_runner(
             # No preferred format: the app, or the upstream it fronts, picks. Only
             # control-plane calls ask for JSON.
             request_headers: dict[str, str] = {"Accept": "*/*"}
+            if "accept" in application_headers:
+                request_headers.pop("Accept")
+            request_headers.update(application_headers)
             if content_type is not None:
                 request_headers["Content-Type"] = content_type
             if signer_url:
@@ -915,6 +931,7 @@ async def call_runner(
                         payload=payload,
                         headers=request_headers or None,
                         connect_timeout=timeout,
+                        **({"return_http_errors": True} if return_http_errors else {}),
                     )
                     call_stream = LiveRunnerCallStream(
                         resp.status,

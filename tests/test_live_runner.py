@@ -830,6 +830,24 @@ def _json_data(data: dict[str, object]) -> tuple[bytes, str]:
     return json.dumps(data).encode("utf-8"), "application/json"
 
 
+    @pytest.mark.parametrize("payment_call", [True], indirect=True)
+    async def test_native_headers_and_bytes_survive_payment_challenge(self, payment_call):
+        call = payment_call
+        sessions = []
+        result = await call_runner(
+            **call.kwargs, payload=b' {"original":true} ', content_type="application/json",
+            headers={"Anthropic-Version": "2023-06-01"}, return_http_errors=True,
+            on_payment_session=lambda session: sessions.append(session),
+        )
+        for args in call.transport.call_args_list:
+            assert args.kwargs["payload"] == b' {"original":true} '
+            assert args.kwargs["headers"]["anthropic-version"] == "2023-06-01"
+            assert args.kwargs["return_http_errors"] is True
+        assert len(sessions) == 1
+        assert call.transport.call_args_list[-1].kwargs["headers"]["Livepeer-Payment"] == "payment"
+        await result.aclose()
+
+
 class _FakeO2RReader:
     instances: list[_FakeO2RReader] = []
 
