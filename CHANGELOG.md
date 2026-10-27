@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `call_runner(on_payment_attempt=..., on_payment_error=...)` hooks for durable
+  pre-sign intent and structured signing failures. Cancellation remains prompt;
+  an unresolved intent does not imply that the signer did not charge.
 - `LiveRunnerRegistration.stop_session()` to stop reserved sessions
 - `LiveRunnerSessionEvent.session_token` field for session management
 - `call_runner(on_payment_session=...)` callback for each new payment session

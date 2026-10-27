@@ -676,6 +676,103 @@ class TestPaymentSessionCallback:
                 challenge=challenge,
             )
 
+    async def test_payment_intent_is_awaited_before_signing(self, payment_call) -> None:
+        seen = []
+
+        async def intent(session):
+            assert payment_call.signer.await_count == 0
+            await asyncio.sleep(0)
+            seen.append(session.manifest_id)
+
+        await call_runner(**payment_call.kwargs, on_payment_attempt=intent)
+        assert seen == ["manifest-1"]
+        assert payment_call.signer.await_count == 1
+
+    async def test_signing_error_reports_the_attempt_before_refresh(self, payment_call) -> None:
+        failure = SignerRefreshRequired("expired challenge")
+        payment_call.signer.side_effect = [failure, payment_call.signer.return_value]
+        payment_call.transport.side_effect = [
+            payment_call.challenge("expired"), payment_call.challenge("fresh"), payment_call.reply,
+        ]
+        seen = []
+
+        async def failed(session, error):
+            assert payment_call.transport.await_count == 1
+            seen.append((session.manifest_id, error))
+
+        await call_runner(**payment_call.kwargs, on_payment_error=failed)
+        assert seen == [("expired", failure)]
+
+    async def test_cancellation_does_not_wait_for_an_error_hook(self, payment_call) -> None:
+        signing = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_signer(*args, **kwargs):
+            signing.set()
+            await release.wait()
+
+        async def blocked_error(*args):
+            await release.wait()
+
+        error_hook = mock.AsyncMock(side_effect=blocked_error)
+        payment_call.signer.side_effect = blocked_signer
+        task = asyncio.create_task(call_runner(**payment_call.kwargs, on_payment_error=error_hook))
+        try:
+            await asyncio.wait_for(signing.wait(), 1)
+            task.cancel()
+            done, _ = await asyncio.wait([task], timeout=0.1)
+            assert task in done
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            error_hook.assert_not_called()
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.parametrize("payment_call", [False, True], indirect=True)
+    async def test_sync_intent_callback_precedes_signer_and_success(self, payment_call) -> None:
+        seen = []
+
+        def intent(session):
+            assert payment_call.signer.await_count == 0
+            seen.append(("intent", session.manifest_id))
+
+        result = await call_runner(
+            **payment_call.kwargs, on_payment_attempt=intent,
+            on_payment_session=lambda session: seen.append(("paid", session.manifest_id)),
+        )
+        if payment_call.kwargs["stream"]:
+            await result.aclose()
+        assert seen == [("intent", "manifest-1"), ("paid", "manifest-1")]
+
+    @pytest.mark.parametrize("hook", ["on_payment_attempt", "on_payment_error"])
+    @pytest.mark.parametrize("error", [RuntimeError("storage failed"), SignerRefreshRequired("callback")])
+    async def test_intent_hook_errors_abort_without_retry(self, payment_call, hook, error) -> None:
+        if hook == "on_payment_error":
+            payment_call.signer.side_effect = SignerRefreshRequired("signer")
+        with pytest.raises(type(error)) as raised:
+            await call_runner(**payment_call.kwargs, **{hook: mock.AsyncMock(side_effect=error)})
+        assert raised.value is error
+        assert payment_call.signer.await_count == (1 if hook == "on_payment_error" else 0)
+        assert payment_call.transport.await_count == 1
+
+    @pytest.mark.parametrize("failure", [
+        LivepeerHTTPError(500, "https://signer.example.com"),
+        {"payment": "ticket", "segCreds": None, "state": {}},
+    ])
+    async def test_error_hook_receives_the_original_signing_error(self, payment_call, failure) -> None:
+        if isinstance(failure, Exception):
+            payment_call.signer.side_effect = failure
+        else:
+            payment_call.signer.return_value = failure
+        seen = []
+        with pytest.raises(LivepeerGatewayError) as raised:
+            await call_runner(**payment_call.kwargs, on_payment_error=lambda session, error: seen.append(
+                (session.manifest_id, error)
+            ))
+        assert seen == [("manifest-1", raised.value)]
+
     @pytest.mark.parametrize(
         "payment_call,async_callback,payment_unit",
         [(False, False, "fixed"), (True, True, "seconds")],

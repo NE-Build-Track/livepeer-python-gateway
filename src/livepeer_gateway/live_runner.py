@@ -90,6 +90,7 @@ class LiveRunnerSessionEvent:
 
 LiveRunnerSessionCallback = Callable[[LiveRunnerSessionEvent], None | Awaitable[None]]
 LivePaymentSessionCallback = Callable[[LivePaymentSession], None | Awaitable[None]]
+LivePaymentErrorCallback = Callable[[LivePaymentSession, Exception], None | Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -785,6 +786,8 @@ async def call_runner(
     timeout: float = ...,
     max_payment_challenge_retries: int = ...,
     on_payment_session: LivePaymentSessionCallback | None = ...,
+    on_payment_attempt: LivePaymentSessionCallback | None = ...,
+    on_payment_error: LivePaymentErrorCallback | None = ...,
     stream: Literal[False] = False,
 ) -> LiveRunnerCallResult:
     pass
@@ -804,6 +807,8 @@ async def call_runner(
     timeout: float = ...,
     max_payment_challenge_retries: int = ...,
     on_payment_session: LivePaymentSessionCallback | None = ...,
+    on_payment_attempt: LivePaymentSessionCallback | None = ...,
+    on_payment_error: LivePaymentErrorCallback | None = ...,
     stream: Literal[True],
 ) -> LiveRunnerCallStream:
     pass
@@ -822,6 +827,8 @@ async def call_runner(
     timeout: float = 5.0,
     max_payment_challenge_retries: int = 3,
     on_payment_session: LivePaymentSessionCallback | None = None,
+    on_payment_attempt: LivePaymentSessionCallback | None = None,
+    on_payment_error: LivePaymentErrorCallback | None = None,
     stream: bool = False,
 ) -> LiveRunnerCallResult | LiveRunnerCallStream:
     """Call a runner once and return its result (or a live stream if ``stream=True``).
@@ -830,9 +837,18 @@ async def call_runner(
     paid via the signer and retried (up to ``max_payment_challenge_retries``), one job,
     one upfront payment. Raises ``LivepeerHTTPError`` on non-402 errors.
 
-    After a new payment session is obtained, `on_payment_session` is called.
-    Metered renewals do not invoke it. The callback may be sync or
-    async. Its exceptions propagate and abort the call.
+    Before each new session's first signing request, ``on_payment_attempt(session)``
+    is awaited. Use it to durably record intent; its failure prevents signing.
+    After a validated payment response, ``on_payment_session(session)`` runs before
+    dispatch. If signing or response validation raises an Exception,
+    ``on_payment_error(session, error)`` runs before any challenge-refresh retry.
+    It receives the original error; a failed or missing response is not proof that
+    no payment occurred. Cancellation propagates without invoking the error hook,
+    so a recorded intent may remain unresolved.
+
+    All three callbacks may be sync or async; their exceptions abort the call.
+    They apply to new sessions, not metered renewals. Hooks should bound their own
+    I/O. Signing is never shielded or drained after cancellation.
 
     ``application/json`` and ``+json`` types parse into ``result.data``; anything else
     (an image, ndjson) comes back unparsed in ``result.content`` + ``result.content_type``.
@@ -883,10 +899,18 @@ async def call_runner(
                     app=runner.app if runner is not None else None,
                     max_price=max_price.to_json() if max_price is not None else None,
                 )
+                if on_payment_attempt is not None:
+                    result = on_payment_attempt(payment_session)
+                    if inspect.isawaitable(result):
+                        await result
                 try:
                     payment = await payment_session.get_payment()
-                except SignerRefreshRequired as e:
-                    if attempt + 1 >= attempts:
+                except Exception as e:
+                    if on_payment_error is not None:
+                        result = on_payment_error(payment_session, e)
+                        if inspect.isawaitable(result):
+                            await result
+                    if not isinstance(e, SignerRefreshRequired) or attempt + 1 >= attempts:
                         raise
                     # Could happen if embedded payment params expire; just retry in this case.
                     _LOG.info(
