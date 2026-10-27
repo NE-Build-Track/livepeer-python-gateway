@@ -221,7 +221,7 @@ class LivePaymentSession:
             )
 
         seg_creds = data.get("segCreds")
-        if not isinstance(seg_creds, str) or not seg_creds:
+        if seg_creds is not None and not isinstance(seg_creds, str):
             raise PaymentError(
                 f"GetPayment error: invalid 'segCreds' in response (url={url})"
             )
@@ -232,7 +232,14 @@ class LivePaymentSession:
                 f"Remote signer response missing 'state' object (url={url})"
             )
 
+        # A blank segment is unusable, but signing may have advanced the cursor.
+        # Preserve valid state before rejecting it so a metered renewal does not
+        # resubmit the previous cursor. Invalid types/state never replace it.
         self._state = state
+        if not seg_creds:
+            raise PaymentError(
+                f"GetPayment error: invalid 'segCreds' in response (url={url})"
+            )
         return GetPaymentResponse(payment=payment, seg_creds=seg_creds)
 
     async def _refresh_payment_params(self) -> None:

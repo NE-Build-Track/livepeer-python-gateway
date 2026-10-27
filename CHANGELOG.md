@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Preserve a valid signer state when rejecting blank segment credentials, so
+  subsequent metered renewals do not reuse the previous cursor. Blank segments
+  remain rejected and are never sent to the orchestrator.
 - `discover_orchestrators` is now asynchronous and must be awaited, including
   when given explicit orchestrator addresses.
 

@@ -7,6 +7,7 @@ import pytest
 
 from livepeer_gateway.errors import (
     LivepeerHTTPError,
+    PaymentError,
     SignerRefreshRequired,
 )
 from livepeer_gateway.remote_signer import (
@@ -32,6 +33,75 @@ class TestLivePaymentSession:
     def clear_signer_info_cache(self):
         yield
         get_signer_info.cache_clear()
+
+    @pytest.mark.parametrize("blank_segment", [None, ""])
+    async def test_blank_segment_keeps_new_state_for_the_next_renewal(
+        self, blank_segment: str | None,
+    ) -> None:
+        session = LivePaymentSession(
+            "https://signer.example.com", type="live", challenge=_challenge(),
+        )
+        signer = mock.AsyncMock(side_effect=[
+            {"payment": "p1", "segCreds": "s1", "state": {"cursor": "one"}},
+            {"payment": "p2", "segCreds": blank_segment, "state": {"cursor": "two"}},
+            {"payment": "p3", "segCreds": "s3", "state": {"cursor": "three"}},
+        ])
+        posted = mock.AsyncMock()
+        with (
+            mock.patch("livepeer_gateway.http.post_json", signer),
+            mock.patch("livepeer_gateway.http._post_empty", posted),
+        ):
+            await session.send_payment()
+            with pytest.raises(PaymentError, match="segCreds"):
+                await session.send_payment()
+            assert posted.await_count == 1, "never POST a blank segment to the orchestrator"
+            await session.send_payment()
+
+        assert signer.await_args_list[2].args[1]["state"] == {"cursor": "two"}
+        assert posted.await_count == 2
+        assert posted.await_args.kwargs["headers"]["Livepeer-Segment"] == "s3"
+
+    @pytest.mark.parametrize("invalid", [
+        {"payment": "p2", "segCreds": 123, "state": {"cursor": "two"}},
+        {"payment": "p2", "segCreds": ""},
+        {"payment": "p2", "segCreds": None, "state": []},
+        {"payment": None, "segCreds": "", "state": {"cursor": "two"}},
+    ])
+    async def test_invalid_response_fields_do_not_replace_signer_state(self, invalid) -> None:
+        session = LivePaymentSession(
+            "https://signer.example.com", type="live", challenge=_challenge(),
+        )
+        signer = mock.AsyncMock(side_effect=[
+            {"payment": "p1", "segCreds": "s1", "state": {"cursor": "one"}},
+            invalid,
+            {"payment": "p3", "segCreds": "s3", "state": {"cursor": "three"}},
+        ])
+        with mock.patch("livepeer_gateway.http.post_json", signer):
+            await session.get_payment()
+            with pytest.raises(PaymentError):
+                await session.get_payment()
+            await session.get_payment()
+
+        assert signer.await_args_list[2].args[1]["state"] == {"cursor": "one"}
+
+    @pytest.mark.parametrize("blank_segment", [None, ""])
+    async def test_initial_blank_segment_keeps_state_without_accepting_payment(
+        self, blank_segment: str | None,
+    ) -> None:
+        session = LivePaymentSession(
+            "https://signer.example.com", type="live", challenge=_challenge(),
+        )
+        signer = mock.AsyncMock(side_effect=[
+            {"payment": "p1", "segCreds": blank_segment, "state": {"cursor": "one"}},
+            {"payment": "p2", "segCreds": "s2", "state": {"cursor": "two"}},
+        ])
+        with mock.patch("livepeer_gateway.http.post_json", signer):
+            with pytest.raises(PaymentError, match="segCreds"):
+                await session.get_payment()
+            await session.get_payment()
+
+        assert "state" not in signer.await_args_list[0].args[1]
+        assert signer.await_args_list[1].args[1]["state"] == {"cursor": "one"}
 
     async def test_none_signer_exits_early(self) -> None:
         session = LivePaymentSession(
